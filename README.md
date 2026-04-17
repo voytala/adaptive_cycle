@@ -2,6 +2,7 @@
 inputs -- self explanatory directiory
 usage: adaptive_cycle.py [input file] --time [t] --save-prefix [prefix]
 Input file format:
+
     n
     x1_0 x2_0 ... xn_0
     j1 j2 ... jn : alpha1 alpha2 ... alphan
