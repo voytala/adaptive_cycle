@@ -836,46 +836,46 @@ def main():
             np.column_stack((sol.t, connected_vals)),
             delimiter=",", header="time,connectedness", comments=""
         )
-        np.savetxt(
-            str(output_dir / "row_entropy_conn.csv"),
-            np.column_stack((sol.t, row_entropy_vals)),
-            delimiter=",", header="time,row_entropy_connectedness", comments=""
-        )
+        #np.savetxt(
+        #    str(output_dir / "row_entropy_conn.csv"),
+        #    np.column_stack((sol.t, row_entropy_vals)),
+        #    delimiter=",", header="time,row_entropy_connectedness", comments=""
+        #)
         np.savetxt(
             str(output_dir / "R_loc.csv"),
             np.column_stack((sol.t, Rloc)),
             delimiter=",", header="time,R_loc", comments=""
         )
-        np.savetxt(
-            str(output_dir / "R_loc_pc.csv"),
-            np.column_stack((sol.t, Rloc_pc)),
-            delimiter=",", header="time,R_loc_pc", comments=""
-        )
+        #np.savetxt(
+        #    str(output_dir / "R_loc_pc.csv"),
+        #    np.column_stack((sol.t, Rloc_pc)),
+        #    delimiter=",", header="time,R_loc_pc", comments=""
+        #)
         np.savetxt(
             str(output_dir / "R_spec.csv"),
             np.column_stack((sol.t, Rspec)),
             delimiter=",", header="time,R_spec", comments=""
         )
-        np.savetxt(
-            str(output_dir / "R_spec_pc.csv"),
-            np.column_stack((sol.t, Rspec_pc)),
-            delimiter=",", header="time,R_spec_pc", comments=""
-        )
+        #np.savetxt(
+        #    str(output_dir / "R_spec_pc.csv"),
+        #    np.column_stack((sol.t, Rspec_pc)),
+        #    delimiter=",", header="time,R_spec_pc", comments=""
+        #)
         np.savetxt(
             str(output_dir / "R_energy.csv"),
             np.column_stack((sol.t, Renergy)),
             delimiter=",", header="time,R_energy", comments=""
         )
-        np.savetxt(
-            str(output_dir / "R_energy_pc.csv"),
-            np.column_stack((sol.t, Renergy_pc)),
-            delimiter=",", header="time,R_energy_pc", comments=""
-        )
-        np.savetxt(
-            str(output_dir / "Rnorm.csv"),
-            np.column_stack((sol.t, Rnorm)),
-            delimiter=",", header="time,R_norm", comments=""
-        )
+        #np.savetxt(
+        #    str(output_dir / "R_energy_pc.csv"),
+        #    np.column_stack((sol.t, Renergy_pc)),
+        #    delimiter=",", header="time,R_energy_pc", comments=""
+        #)
+        #np.savetxt(
+        #    str(output_dir / "Rnorm.csv"),
+        #    np.column_stack((sol.t, Rnorm)),
+        #    delimiter=",", header="time,R_norm", comments=""
+        #)
         np.savetxt(
             str(output_dir / "Rspec_hyper.csv"),
             np.column_stack((sol.t, Rspec_hyper)),
@@ -890,6 +890,13 @@ def main():
             str(output_dir / "linear_connectedness.csv"),
             np.column_stack((sol.t, linear_conn_vals)),
             delimiter=",", header="time,linear_connectedness", comments=""
+        )
+        np.savetxt(
+            str(output_dir / "biomass.csv"),
+            np.column_stack((sol.t, x_vals)),
+            delimiter=",",
+            header="time," + ",".join([f"x{i+1}" for i in range(n)]),
+            comments=""
         )
 
     # =========================
