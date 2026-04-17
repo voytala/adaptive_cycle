@@ -12,7 +12,7 @@ Input file format:
     Parametr alphai represent coefficient of that monomial in i-th equation of model.
     Note: it shall be simplified soon
  
-Other directories are outputs.  
+Other directories contain outputs.  
 biomass.csv - numerical solution for given ODE
 [parameter name].csv - specific parameter outputs
 linear-graph.gif - animation for parameters based on linearisation. Thickness of edge represents relative intensity of interaction. Color represents positivity/negativity. Size of node represents relative biomass of corresponding species
