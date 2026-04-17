@@ -1,5 +1,5 @@
 # adaptive_cycle
-## usage
+## Usage
 adaptive_cycle.py [input file] --time [t] --save-prefix [prefix]
 ## Input file format
 
@@ -16,6 +16,7 @@ adaptive_cycle.py [input file] --time [t] --save-prefix [prefix]
 inputs -- self explanatory directiory
 
 [dir_name] -- output directiory
+
 biomass.csv - numerical solution for given ODE
 
 [parameter name].csv - specific parameter outputs
