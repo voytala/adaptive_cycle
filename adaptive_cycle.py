@@ -10,6 +10,7 @@ from matplotlib.widgets import Slider
 from matplotlib.collections import LineCollection
 from scipy.integrate import solve_ivp, trapezoid
 from numpy.linalg import eigvals
+import re
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -78,25 +79,142 @@ def prepare_output_dir(save_prefix):
 
 def load_model(filename):
     """
-    Reads model from a file. Expected format:
-    n
-    x1_0 x2_0 ... xn_0
-    j1 j2 ... jn : alpha1 alpha2 ... alphan
-
-    xi_0 is an initial state of agent i.
-    Each line represents monomial x1^j1*...*xn^jn.
-    Parametr alphai represent coefficient of that monomial in i-th equation of model.
+    Robust parser for:
+        dx_i = x_i ( ... multiline polynomial ... )
     """
-    interactions = {}
+
+    eq_pattern = re.compile(
+        r"^dx_(\d+)\s*=\s*x_(\d+)\s*\(\s*(.*?)\s*\)\s*$",
+        re.DOTALL
+    )
+
+    mono_pattern = re.compile(r"x_(\d+)(?:\^(\d+))?")
+
+    def join_equations(lines):
+        """
+        Składa multiline equation blocks poprawnie:
+        - ignoruje puste linie
+        - ignoruje komentarze
+        - zachowuje pełne nawiasy
+        """
+        blocks = []
+        buf = ""
+        depth = 0
+
+        for raw in lines:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            if line.startswith("dx_") and depth == 0:
+                if buf:
+                    blocks.append(buf.strip())
+                    buf = ""
+
+            buf += " " + line
+
+            depth += line.count("(") - line.count(")")
+
+            if depth == 0 and buf:
+                blocks.append(buf.strip())
+                buf = ""
+
+        if buf.strip():
+            blocks.append(buf.strip())
+
+        if depth != 0:
+            raise ValueError("Unbalanced parentheses in model input")
+
+        return blocks
+
+    def split_terms(poly):
+        """
+        poprawne splitowanie: + i - tylko na poziomie top-level
+        """
+        poly = poly.replace(" ", "")
+        terms = []
+        start = 0
+        depth = 0
+
+        for i in range(1, len(poly)):
+            if poly[i] == "(":
+                depth += 1
+            elif poly[i] == ")":
+                depth -= 1
+
+            if depth == 0 and poly[i] in "+-":
+                terms.append(poly[start:i])
+                start = i
+
+        terms.append(poly[start:])
+        return [t for t in terms if t]
+
+    def parse_term(term, n):
+        term = term.replace(" ", "")
+        matches = list(mono_pattern.finditer(term))
+        exponents = [0] * n
+
+        if matches:
+            coeff_part = term[:matches[0].start()]
+
+            for m in matches:
+                idx = int(m.group(1)) - 1
+                exp = int(m.group(2)) if m.group(2) else 1
+                exponents[idx] += exp
+        else:
+            coeff_part = term
+
+        if coeff_part in ("", "+"):
+            coeff = 1.0
+        elif coeff_part == "-":
+            coeff = -1.0
+        else:
+            coeff = float(coeff_part)
+
+        return tuple(exponents), coeff
+
     with open(filename, 'r') as f:
-        lines = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+        lines = f.readlines()
+
+    lines = [l.rstrip("\n") for l in lines if l.strip() and not l.strip().startswith("#")]
+
     n = int(lines[0])
-    x0 = np.array([float(x) for x in lines[1].split()])
-    for line in lines[2:]:
-        parts = line.split(':')
-        j = tuple(int(x) for x in parts[0].split())
-        alpha = [float(x) for x in parts[1].split()]
-        interactions[j] = alpha
+    x0 = np.array(list(map(float, lines[1].split())))
+
+    eq_blocks = join_equations(lines[2:])
+
+    if len(eq_blocks) != n:
+        raise ValueError(f"Expected {n} equations, got {len(eq_blocks)}")
+
+    interactions = {}
+    seen = set()
+
+    for block in eq_blocks:
+        m = eq_pattern.match(block)
+        if not m:
+            raise ValueError(f"Cannot parse block:\n{block}")
+
+        i = int(m.group(1))
+        j = int(m.group(2))
+        poly = m.group(3)
+
+        if i != j:
+            raise ValueError("dx_i mismatch")
+
+        seen.add(i)
+
+        eq_terms = defaultdict(float)
+        for term in split_terms(poly):
+            mon, coeff = parse_term(term, n)
+            eq_terms[mon] += coeff
+
+        for mon, coeff in eq_terms.items():
+            if mon not in interactions:
+                interactions[mon] = [0.0] * n
+            interactions[mon][i - 1] += coeff
+
+    if len(seen) != n:
+        raise ValueError("Missing equations")
 
     support_map = defaultdict(list)
     for j in interactions:
@@ -105,10 +223,12 @@ def load_model(filename):
 
     return n, x0, interactions, support_map
 
-
 def x_pow_j(x, j):
-    return np.prod([x[i]**j[i] if not (x[i] == 0 and j[i] == 0) else 1
-                    for i in range(len(x))])
+    x = np.asarray(x)
+    return np.prod([
+        (x[i] ** j[i]) if j[i] != 0 else 1.0
+        for i in range(len(x))
+    ])
 
 
 def T_ji(x, interactions, support_map, n):
@@ -147,6 +267,7 @@ def g_per_capita(x, interactions, n):
 
 
 def potential(x, interactions, support_map, n):
+    x = np.maximum(x, 1e-12)
     T = T_ji(x, interactions, support_map, n)
     H_i = []
     for i in range(n):
@@ -165,6 +286,7 @@ def potential(x, interactions, support_map, n):
 
 
 def potential_global(x, interactions, support_map, n):
+    x = np.maximum(x, 1e-12)
     T = T_ji(x, interactions, support_map, n)
     contribs = [abs(v) for v in T.values()]
     T_total = sum(contribs)
@@ -174,6 +296,7 @@ def potential_global(x, interactions, support_map, n):
 
 
 def connectedness(x, interactions, support_map, n):
+    x = np.maximum(x, 1e-12)
     T = T_ji(x, interactions, support_map, n)
     T_out = {K: 0.0 for K in support_map}
     T_in = {i: 0.0 for i in range(n)}
@@ -195,6 +318,7 @@ def connectedness(x, interactions, support_map, n):
 
 
 def row_entropy_connectedness(x, interactions, support_map, n):
+    x = np.maximum(x, 1e-12)
     T = T_ji(x, interactions, support_map, n)
     T_out = {K: 0.0 for K in support_map}
     for (K, i), v in T.items():
@@ -757,6 +881,137 @@ def plot_phase_colored_curve(potential_vals, connected_vals, resilience_vals, ti
     return fig
 
 
+# =========================
+# PLOTS (STATIC)
+# =========================
+
+# Tu ustawiasz, które wykresy trafiają do których plików.
+# Zmieniasz tylko ten słownik.
+PLOT_GROUPS = {
+    "linearized_plots": [
+        "biomass",
+        "linear_potential",
+        "linear_connectedness",
+        "R_loc",
+        "R_energy",
+        "R_spec",
+    ],
+    "hypergraph_plots": [
+        "biomass",
+        "potential",
+        "potential_global",
+        "connectedness",
+        "R_energy",
+        "Rspec_hyper",
+    ],
+}
+
+# Etykiety i styl dla pojedynczych serii
+PLOT_LABELS = {
+    "potential": "Φ: Local Potential",
+    "potential_global": "Ψ: Global Entropy",
+    "connectedness": "Connectedness",
+    "R_loc": "R_loc",
+    "R_spec": "R_spec",
+    "R_energy": "R_energy",
+    "Rspec_hyper": "R_spec_hyper",
+    "linear_potential": "Linear Potential",
+    "linear_connectedness": "Linear Connectedness",
+}
+
+PLOT_STYLES = {
+    "potential": "g-",
+    "potential_global": "g-",
+    "connectedness": "b-",
+    "R_loc": "r-",
+    "R_loc_pc": "r-",
+    "R_spec": "r-",
+    "R_energy": "r-",
+    "Rspec_hyper": "r-",
+    "linear_potential": "g-",
+    "linear_connectedness": "b-",
+}
+
+
+def plot_group(sol, data_dict, group_keys, group_name=None,
+               hspace=0.06, top=0.95, bottom=0.08, left=0.12, right=0.85):
+    """
+    Rysuje jedną grupę wykresów jako osobną figurę.
+    data_dict:
+        key -> 1D array albo lista 1D arrayów
+    """
+    n_plots = len(group_keys)
+    fig, axes = plt.subplots(
+        n_plots, 1,
+        figsize=(7.0, 2.2 * n_plots),
+        sharex=True,
+        gridspec_kw={'hspace': hspace}
+    )
+
+    if n_plots == 1:
+        axes = [axes]
+
+    for ax, key in zip(axes, group_keys):
+        y_data = data_dict[key]
+
+        if key == "biomass":
+            # biomass = lista serii, po jednej na gatunek
+            for i, y in enumerate(y_data):
+                ax.plot(sol.t, y, label=f"Gatunek {i+1}")
+            ylabel = "Biomasa"
+        else:
+            # zwykła pojedyncza seria
+            style = PLOT_STYLES.get(key, None)
+            label = PLOT_LABELS.get(key, key)
+
+            if style is None:
+                ax.plot(sol.t, y_data, label=label)
+            else:
+                ax.plot(sol.t, y_data, style, label=label)
+
+            ylabel = label
+
+        ax.set_ylabel(ylabel, fontsize=10)
+        ax.grid(True, alpha=0.3)
+
+        # sensowne limity osi Y
+        if key == "biomass":
+            all_vals = np.concatenate([np.asarray(y) for y in y_data])
+        else:
+            all_vals = np.asarray(y_data)
+
+        ymin = np.min(all_vals)
+        ymax = np.max(all_vals)
+        center = (ymax + ymin) / 2
+        half_range = max(ymax - center, center - ymin)
+        margin = 0.04 * (2 * half_range if half_range != 0 else 1.0)
+        ax.set_ylim(center - half_range - margin, center + half_range + margin)
+
+        if ax.get_ylim()[0] < 0 < ax.get_ylim()[1]:
+            ax.axhline(0, color='grey', linewidth=0.5, alpha=0.5)
+
+        ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=9)
+
+    axes[-1].set_xlabel("Czas", fontsize=12)
+
+    if group_name is not None:
+        fig.suptitle(group_name, fontsize=12)
+
+    fig.subplots_adjust(top=top, bottom=bottom, left=left, right=right, hspace=hspace)
+    return fig
+
+
+def save_all_figures(output_dir, sol, data_dict):
+    """
+    Zapisuje każdą grupę wykresów do osobnego pliku.
+    Nazwa pliku = klucz z PLOT_GROUPS, np. main.pdf, resilience.pdf
+    """
+    for group_name, group_keys in PLOT_GROUPS.items():
+        fig = plot_group(sol, data_dict, group_keys, group_name=group_name)
+        fig.savefig(output_dir / f"{group_name}.pdf", bbox_inches="tight")
+        fig.savefig(output_dir / f"{group_name}.png", dpi=300, bbox_inches="tight")
+        plt.close(fig)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('input_file')
@@ -777,12 +1032,19 @@ def main():
     n, x0, interactions, support_map = load_model(input_path)
 
     t_eval = np.linspace(0, args.time, int(args.time * 10))
+    def rhs(t, x):
+        x = np.clip(x, 1e-12, 1e6)  # stabilizacja
+        return f(x, interactions, support_map, n)
+
     sol = solve_ivp(
-        lambda t, x: f(x, interactions, support_map, n),
+        rhs,
         (0, args.time),
         x0,
         t_eval=t_eval,
-        method='LSODA'
+        method='LSODA',
+        rtol=1e-7,
+        atol=1e-9,
+        max_step=0.1
     )
 
     x_vals = sol.y.T
@@ -899,6 +1161,24 @@ def main():
             comments=""
         )
 
+    data_dict = {
+        "biomass": [sol.y[i] for i in range(n)],
+        "potential": potential_vals,
+        "potential_global": potential_global_vals,
+        "connectedness": connected_vals,
+        #"row_entropy_conn": row_entropy_vals,
+        "R_loc": Rloc,
+        #"R_loc_pc": Rloc_pc,
+        "R_spec": Rspec,
+        #"R_spec_pc": Rspec_pc,
+        "R_energy": Renergy,
+        #"R_energy_pc": Renergy_pc,
+        #"R_norm": Rnorm,
+        "Rspec_hyper": Rspec_hyper,
+        "linear_potential": linear_pot_vals,
+        "linear_connectedness": linear_conn_vals,
+    }
+
     # =========================
     # PLOTS (STATIC)
     # =========================
@@ -964,31 +1244,11 @@ def main():
         fig.subplots_adjust(top=top, bottom=bottom, left=left, right=right, hspace=hspace)
         return fig
 
-    def save_all_figures(output_dir):
-        fig = plot_all()
-        fig.savefig(str(output_dir / "plots.pdf"), bbox_inches="tight")
-        fig.savefig(str(output_dir / "plots.png"), dpi=300, bbox_inches="tight")
-        plt.close(fig)
-
-        fig = plot_phase_colored_curve(
-            connected_vals,
-            potential_vals,
-            Rspec_hyper,
-            sol.t,
-            xlabel="Spójność",
-            ylabel="Potencjał",
-            rlabel="Odporność",
-            tmin=0,
-            tmax=5
-        )
-        fig.savefig(str(output_dir / "phase_curve.pdf"), bbox_inches="tight")
-        plt.close(fig)
-
     # =========================
     # MAIN OUTPUT PIPELINE
     # =========================
     if output_dir is not None:
-        save_all_figures(output_dir)
+        save_all_figures(output_dir, sol, data_dict)
 
         save_hypergraph_animation(
             sol,
