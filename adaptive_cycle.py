@@ -10,6 +10,7 @@ from matplotlib.widgets import Slider
 from matplotlib.collections import LineCollection
 from scipy.integrate import solve_ivp, trapezoid
 from numpy.linalg import eigvals
+from tensor_laplacian import compute_tensor_laplacian_spectrum
 import re
 
 
@@ -131,7 +132,8 @@ def load_model(filename):
         """
         poprawne splitowanie: + i - tylko na poziomie top-level
         """
-        poly = poly.replace(" ", "")
+        poly = poly.replace(" ", "").replace("*", "")  # <-- DODANE
+
         terms = []
         start = 0
         depth = 0
@@ -819,6 +821,37 @@ def R_spec_hyper(x, interactions, n):
     return min(nonzero_real_parts) if nonzero_real_parts else 0.0
 
 
+def R_tensor_laplacian(x, interactions, support_map, n):
+    """
+    Nowa miara odporności oparta o spektrum tensorowego Laplasjanu.
+
+    Idea:
+        - budujemy hipergraf z interakcji w punkcie x
+        - liczymy dominującą wartość własną Laplasjanu tensorowego
+        - interpretujemy ją jako miarę "sztywności / odporności strukturalnej"
+
+    Zwraca:
+        R = -lambda_max
+        (im większe R, tym bardziej stabilny układ)
+    """
+
+    # --- wyciągamy wymiar tensora ---
+    k = len(next(iter(support_map))) if support_map else 2
+
+    # --- budowa spektrum ---
+    result = compute_tensor_laplacian_spectrum(
+        interactions=interactions,
+        x=x,
+        n=n,
+        k=k
+    )
+
+    lam = result["lambda"]
+
+    # --- konwencja stabilności ---
+    return -lam
+
+
 def plot_phase_colored_curve(potential_vals, connected_vals, resilience_vals, time_vals,
                              xlabel="Potential", ylabel="Connectedness",
                              rlabel="Resilience", cmap="viridis",
@@ -904,6 +937,14 @@ PLOT_GROUPS = {
         "R_energy",
         "Rspec_hyper",
     ],
+    "tensor_plots": [
+        "biomass",
+        "potential",
+        "potential_global",
+        "connectedness",
+        "Rtensor_laplacian",
+        "Rspec_hyper",
+    ],
 }
 
 # Etykiety i styl dla pojedynczych serii
@@ -915,6 +956,7 @@ PLOT_LABELS = {
     "R_spec": "R_spec",
     "R_energy": "R_energy",
     "Rspec_hyper": "R_spec_hyper",
+    "Rtensor_laplacian" : "Rtensor_laplacian",
     "linear_potential": "Linear Potential",
     "linear_connectedness": "Linear Connectedness",
 }
@@ -927,6 +969,7 @@ PLOT_STYLES = {
     "R_loc_pc": "r-",
     "R_spec": "r-",
     "R_energy": "r-",
+    "Rtensor_laplacian" : "r-",
     "Rspec_hyper": "r-",
     "linear_potential": "g-",
     "linear_connectedness": "b-",
@@ -957,8 +1000,8 @@ def plot_group(sol, data_dict, group_keys, group_name=None,
         if key == "biomass":
             # biomass = lista serii, po jednej na gatunek
             for i, y in enumerate(y_data):
-                ax.plot(sol.t, y, label=f"Gatunek {i+1}")
-            ylabel = "Biomasa"
+                ax.plot(sol.t, y, label=f"Species {i+1}")
+            ylabel = "Biomass"
         else:
             # zwykła pojedyncza seria
             style = PLOT_STYLES.get(key, None)
@@ -992,7 +1035,7 @@ def plot_group(sol, data_dict, group_keys, group_name=None,
 
         ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=9)
 
-    axes[-1].set_xlabel("Czas", fontsize=12)
+    axes[-1].set_xlabel("Time", fontsize=12)
 
     if group_name is not None:
         fig.suptitle(group_name, fontsize=12)
@@ -1068,6 +1111,7 @@ def main():
 
     Rnorm = np.array([R_norm(x, interactions, support_map, n) for x in x_vals])
     Rspec_hyper = np.array([R_spec_hyper(x, interactions, n) for x in x_vals])
+    Rtensor_laplacian = np.array([R_tensor_laplacian(x, interactions, support_map, n) for x in x_vals])
 
     linear_pot_vals = np.array([
         linear_potential(x, interactions, support_map, n)
@@ -1144,6 +1188,11 @@ def main():
             delimiter=",", header="time,Rspec_hyper", comments=""
         )
         np.savetxt(
+            str(output_dir / "Rtensor_laplacian.csv"),
+            np.column_stack((sol.t, Rtensor_laplacian)),
+            delimiter=",", header="time, Rtensor_laplacian", comments=""
+        )
+        np.savetxt(
             str(output_dir / "linear_potential.csv"),
             np.column_stack((sol.t, linear_pot_vals)),
             delimiter=",", header="time,linear_potential", comments=""
@@ -1175,6 +1224,7 @@ def main():
         #"R_energy_pc": Renergy_pc,
         #"R_norm": Rnorm,
         "Rspec_hyper": Rspec_hyper,
+        "Rtensor_laplacian" : Rtensor_laplacian,
         "linear_potential": linear_pot_vals,
         "linear_connectedness": linear_conn_vals,
     }
