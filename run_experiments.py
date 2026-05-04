@@ -20,6 +20,7 @@ EXPERIMENTS = [
     ("lv.txt", 25, "lv"),
     ("simple.txt", 10, "simple"),
     ("trophic.txt", 25, "trophic"),
+    ("three_order.txt", 10, "three_order"),
 ]
 
 # =========================
