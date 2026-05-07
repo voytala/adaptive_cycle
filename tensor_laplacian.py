@@ -1,13 +1,14 @@
 import numpy as np
 from collections import defaultdict
 
+
 # ============================================================
 # Utils
 # ============================================================
 
 def x_pow_j(x, j):
     """
-    Monomial evaluation: Π x_i^{j_i}
+    Π x_i^{j_i}
     """
     x = np.asarray(x)
     return np.prod([
@@ -22,41 +23,62 @@ def normalize(v):
 
 
 # ============================================================
-# 1. Dynamic hyperedge extraction
+# 1. T_ji (JEDYNE źródło dynamiki)
 # ============================================================
 
-def extract_hyperedges(interactions, x=None):
+def T_ji(x, interactions):
     """
-    Converts polynomial interactions into hyperedges.
+    T_{j->i}(t) = Σ α_k→i * x^{[k]}(t)
 
-    If x is provided → dynamic weighting (IMPORTANT CHANGE).
+    Tu każdy monomial jest traktowany jako osobny składnik
+    przepływu j→i, ale agregujemy je do jednego T.
     """
 
-    edges = []
+    T = {}
 
-    for monomial, coeff_vec in interactions.items():
-        sources = tuple(i for i, p in enumerate(monomial) if p > 0)
+    x = np.maximum(x, 1e-12)
+
+    for (monomial, i), coeff in interactions.items():
+        sources = tuple(j for j, p in enumerate(monomial) if p > 0)
 
         if len(sources) == 0:
             continue
 
-        activation = 1.0 if x is None else x_pow_j(x, monomial)
+        weight = coeff * x_pow_j(x, monomial)
 
-        for target, w in enumerate(coeff_vec):
-            if abs(w) > 1e-15:
-                edges.append((sources, target, w * activation))
+        if abs(weight) > 1e-15:
+            key = (sources, i)
+
+            if key in T:
+                T[key] += weight
+            else:
+                T[key] = weight
+
+    return T
+
+
+# ============================================================
+# 2. Hypergraph z T (wspólna struktura dla wszystkiego)
+# ============================================================
+
+def extract_hyperedges_from_T(T):
+    """
+    Jedna struktura dla Laplasjanu i spójności.
+    """
+    edges = []
+
+    for (sources, target), w in T.items():
+        if abs(w) > 1e-15:
+            edges.append((sources, target, w))
 
     return edges
 
 
 # ============================================================
-# 2. Degree computation
+# 3. Degree computation
 # ============================================================
 
 def compute_degrees(edges, n):
-    """
-    d[i] = sum of incoming hyperedge weights
-    """
     d = np.zeros(n)
 
     for sources, target, w in edges:
@@ -66,24 +88,19 @@ def compute_degrees(edges, n):
 
 
 # ============================================================
-# 3. Laplacian action (implicit tensor operator)
+# 4. Laplacian action
 # ============================================================
 
 def laplacian_action(x, edges, degrees, k):
-    """
-    L(x) = D(x) - A(x)
-    """
     n = len(x)
     y = np.zeros(n)
 
-    # adjacency part
     for sources, target, w in edges:
         prod = 1.0
         for i in sources:
             prod *= x[i]
         y[target] -= w * prod
 
-    # diagonal part
     for i in range(n):
         y[i] += degrees[i] * (x[i] ** (k - 1))
 
@@ -91,11 +108,10 @@ def laplacian_action(x, edges, degrees, k):
 
 
 # ============================================================
-# 4. Power method (tensor eigenvalue approximation)
+# 5. Power method
 # ============================================================
 
 def power_method_hypergraph(edges, n, k, max_iter=80, tol=1e-7):
-
     degrees = compute_degrees(edges, n)
 
     x = np.random.rand(n)
@@ -104,12 +120,9 @@ def power_method_hypergraph(edges, n, k, max_iter=80, tol=1e-7):
     lam_old = 0.0
 
     for _ in range(max_iter):
-
         y = laplacian_action(x, edges, degrees, k)
 
-        # tensor Rayleigh quotient approximation
         lam_vals = []
-
         for i in range(n):
             if abs(x[i]) > 1e-12:
                 lam_vals.append(y[i] / (x[i] ** (k - 1)))
@@ -127,39 +140,34 @@ def power_method_hypergraph(edges, n, k, max_iter=80, tol=1e-7):
 
 
 # ============================================================
-# 5. Main API (USED BY YOUR PROJECT)
+# 6. MAIN SPECTRUM API (NOW CONSISTENT WITH C(t))
 # ============================================================
 
 def compute_tensor_laplacian_spectrum(interactions, x, n, k):
     """
-    Fully dynamic tensor Laplacian spectrum.
-
-    IMPORTANT:
-        - depends on x(t)
-        - recomputed at every time step
+    Laplasjan liczony na T_ji — spójny z definicją spójności.
     """
 
-    edges = extract_hyperedges(interactions, x)
+    T = T_ji(x, interactions)
+    edges = extract_hyperedges_from_T(T)
 
     lam, vec = power_method_hypergraph(edges, n, k)
 
     return {
         "lambda": lam,
         "eigenvector": vec,
-        "edges": edges
+        "edges": edges,
+        "T": T
     }
 
 
 # ============================================================
-# 6. Convenience wrapper (for backward compatibility)
+# 7. STATIC VERSION (debug only)
 # ============================================================
 
 def compute_static_tensor_laplacian_spectrum(interactions, n, k):
-    """
-    Old version (for debugging / comparison only).
-    """
-
-    edges = extract_hyperedges(interactions, x=None)
+    T = T_ji(np.ones(n), interactions)
+    edges = extract_hyperedges_from_T(T)
 
     lam, vec = power_method_hypergraph(edges, n, k)
 

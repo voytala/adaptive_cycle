@@ -4,6 +4,7 @@ from pathlib import Path
 from collections import defaultdict
 
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
 from matplotlib.widgets import Slider
@@ -80,8 +81,12 @@ def prepare_output_dir(save_prefix):
 
 def load_model(filename):
     """
-    Robust parser for:
+    Parser dla:
         dx_i = x_i ( ... multiline polynomial ... )
+
+    Zwraca:
+        n, x0, interactions
+    gdzie interactions[(monomial_tuple, target_index)] = coeff
     """
 
     eq_pattern = re.compile(
@@ -92,12 +97,6 @@ def load_model(filename):
     mono_pattern = re.compile(r"x_(\d+)(?:\^(\d+))?")
 
     def join_equations(lines):
-        """
-        Składa multiline equation blocks poprawnie:
-        - ignoruje puste linie
-        - ignoruje komentarze
-        - zachowuje pełne nawiasy
-        """
         blocks = []
         buf = ""
         depth = 0
@@ -113,7 +112,6 @@ def load_model(filename):
                     buf = ""
 
             buf += " " + line
-
             depth += line.count("(") - line.count(")")
 
             if depth == 0 and buf:
@@ -129,11 +127,7 @@ def load_model(filename):
         return blocks
 
     def split_terms(poly):
-        """
-        poprawne splitowanie: + i - tylko na poziomie top-level
-        """
-        poly = poly.replace(" ", "").replace("*", "")  # <-- DODANE
-
+        poly = poly.replace(" ", "").replace("*", "")
         terms = []
         start = 0
         depth = 0
@@ -158,7 +152,6 @@ def load_model(filename):
 
         if matches:
             coeff_part = term[:matches[0].start()]
-
             for m in matches:
                 idx = int(m.group(1)) - 1
                 exp = int(m.group(2)) if m.group(2) else 1
@@ -175,7 +168,7 @@ def load_model(filename):
 
         return tuple(exponents), coeff
 
-    with open(filename, 'r') as f:
+    with open(filename, "r") as f:
         lines = f.readlines()
 
     lines = [l.rstrip("\n") for l in lines if l.strip() and not l.strip().startswith("#")]
@@ -188,7 +181,7 @@ def load_model(filename):
     if len(eq_blocks) != n:
         raise ValueError(f"Expected {n} equations, got {len(eq_blocks)}")
 
-    interactions = {}
+    interactions = defaultdict(float)  # key: (monomial_tuple, target_index)
     seen = set()
 
     for block in eq_blocks:
@@ -211,19 +204,12 @@ def load_model(filename):
             eq_terms[mon] += coeff
 
         for mon, coeff in eq_terms.items():
-            if mon not in interactions:
-                interactions[mon] = [0.0] * n
-            interactions[mon][i - 1] += coeff
+            interactions[(mon, i - 1)] += coeff
 
     if len(seen) != n:
         raise ValueError("Missing equations")
 
-    support_map = defaultdict(list)
-    for j in interactions:
-        supp = frozenset(i for i, v in enumerate(j) if v != 0)
-        support_map[supp].append(j)
-
-    return n, x0, interactions, support_map
+    return n, x0, dict(interactions)
 
 def x_pow_j(x, j):
     x = np.asarray(x)
@@ -233,78 +219,103 @@ def x_pow_j(x, j):
     ])
 
 
-def T_ji(x, interactions, support_map, n):
-    """
-    Zwraca słownik T[(K,i)] = T^t_{K->i}(x) dla każdej agregowanej interakcji K=frozenset(...)
-    """
-    T = {}
-    for K, js in support_map.items():
-        for i in range(n):
-            if x[i] > 0:
-                total = 0.0
-                for j in js:
-                    total += interactions[j][i] * x_pow_j(x, j)
-                T[(K, i)] = total
-            else:
-                T[(K, i)] = 0.0
-    return T
+def T_ji(x, interactions, n):
+    T = defaultdict(float)
 
+    for (mon, i), coeff in interactions.items():
+        j = tuple(i for i, p in enumerate(mon) if p > 0)  # support
+        key = (j, i)
 
-def f(x, interactions, support_map, n):
-    T = T_ji(x, interactions, support_map, n)
-    return np.array([x[i] * sum(T[(K, i)] for K in support_map) for i in range(n)])
+        T[key] += coeff * x_pow_j(x, mon)
 
+    return dict(T)
+
+def save_tensor_interactions(sol, x_vals, interactions, n, output_dir):
+    rows = []
+
+    for t, x in zip(sol.t, x_vals):
+        T = T_ji(x, interactions, n)
+
+        row = {"time": t}
+
+        for (sources, i), value in T.items():
+            # opcjonalnie: human-readable, ale spójne
+            sources_str = ",".join(str(s + 1) for s in sources)
+
+            key = f"{sources_str}->{i+1}"  # tylko wizualizacja 1-based
+            row[key] = value
+
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+
+    out_path = output_dir / "T_ji.csv"
+    df.to_csv(out_path, index=False)
+
+    print(f"Saved: {out_path}")
+
+def f(x, interactions, n):
+    T = T_ji(x, interactions, n)
+    return np.array([
+        x[i] * sum(v for (mon, j), v in T.items() if j == i)
+        for i in range(n)
+    ])
 
 def g_per_capita(x, interactions, n):
     g = np.zeros(n)
-    for i in range(n):
-        if x[i] == 0:
-            g[i] = 0.0
-        else:
-            total = 0.0
-            for j, alpha in interactions.items():
-                total += alpha[i] * x_pow_j(x, j)
-            g[i] = total
+
+    for (mon, i), alpha in interactions.items():
+        g[i] += alpha * x_pow_j(x, mon)
+
     return g
 
-
-def potential(x, interactions, support_map, n):
+def potential(x, interactions, n):
     x = np.maximum(x, 1e-12)
-    T = T_ji(x, interactions, support_map, n)
+    T = T_ji(x, interactions, n)
+
     H_i = []
+
     for i in range(n):
-        contributions = [abs(T[(K, i)]) for K in support_map]
+        contributions = [abs(v) for (mon, j), v in T.items() if j == i]
         Z = sum(contributions)
+
         if Z == 0:
             H_i.append(0.0)
         else:
             p = [c / Z for c in contributions]
             H_i.append(-Z * sum(pi * np.log(pi) for pi in p if pi > 0))
+
     H = sum(H_i)
+
     if H == 0:
         return 0.0
+
     weights = [hi / H for hi in H_i]
-    return -sum(hi * np.log(w) for hi, w in zip(H_i, weights) if w > 0)
+    return -sum(hi * np.log(w) for hi, w in zip(H_i, weights) if hi > 0 and w > 0)
 
 
-def potential_global(x, interactions, support_map, n):
+def potential_global(x, interactions, n):
     x = np.maximum(x, 1e-12)
-    T = T_ji(x, interactions, support_map, n)
+    T = T_ji(x, interactions, n)
+
     contribs = [abs(v) for v in T.values()]
     T_total = sum(contribs)
+
     if T_total == 0:
         return 0.0
+
     return -sum(a * np.log(a / T_total) for a in contribs if a > 0)
 
-
-def connectedness(x, interactions, support_map, n):
+def connectedness(x, interactions, n):
     x = np.maximum(x, 1e-12)
-    T = T_ji(x, interactions, support_map, n)
-    T_out = {K: 0.0 for K in support_map}
-    T_in = {i: 0.0 for i in range(n)}
-    for (K, i), v in T.items():
+    T = T_ji(x, interactions, n)
+
+    T_out = defaultdict(float)   # po stronie źródła: mon
+    T_in = {i: 0.0 for i in range(n)}  # po stronie celu: i
+
+    for (mon, i), v in T.items():
         a = abs(v)
-        T_out[K] += a
+        T_out[mon] += a
         T_in[i] += a
 
     T_total = sum(T_out.values())
@@ -312,72 +323,107 @@ def connectedness(x, interactions, support_map, n):
         return 0.0
 
     C = 0.0
-    for (K, i), v in T.items():
+    for (mon, i), v in T.items():
         a = abs(v)
-        if a > 0 and T_out[K] > 0 and T_in[i] > 0:
-            C += a * np.log((a * T_total) / (T_out[K] * T_in[i]))
+        if a > 0 and T_out[mon] > 0 and T_in[i] > 0:
+            C += a * np.log((a * T_total) / (T_out[mon] * T_in[i]))
+
     return C
 
-
-def row_entropy_connectedness(x, interactions, support_map, n):
+def row_entropy_connectedness(x, interactions, n):
     x = np.maximum(x, 1e-12)
-    T = T_ji(x, interactions, support_map, n)
-    T_out = {K: 0.0 for K in support_map}
-    for (K, i), v in T.items():
-        T_out[K] += abs(v)
+    T = T_ji(x, interactions, n)
+
+    # traktujemy "monomial nodes" jako źródła
+    T_out = {}
+
+    for (mon, i), v in T.items():
+        T_out.setdefault(mon, 0.0)
+        T_out[mon] += abs(v)
 
     T_total = sum(T_out.values())
+
     if T_total == 0:
         return 0.0
 
     H_row = {}
-    for K, total_K in T_out.items():
-        if total_K == 0:
-            H_row[K] = 0.0
+
+    for mon, total in T_out.items():
+        if total == 0:
+            H_row[mon] = 0.0
         else:
-            vals = [abs(T[(K, i)]) for i in range(n)]
-            p = [v / total_K for v in vals]
-            H_row[K] = -sum(pi * np.log(pi) for pi in p if pi > 0)
+            vals = [abs(v) for (m, i), v in T.items() if m == mon]
+            p = [v / total for v in vals if v > 0]
 
-    return sum(T_out[K] * H_row[K] for K in T_out)
+            H_row[mon] = -sum(pi * np.log(pi) for pi in p if pi > 0)
 
+    return sum(T_out[m] * H_row[m] for m in T_out)
 
-def jacobian(x, interactions, support_map, n):
+def jacobian(x, interactions, n):
     h = 1e-6
-    fx = f(x, interactions, support_map, n)
+    fx = f(x, interactions, n)
     D = np.zeros((n, n))
+
     for j in range(n):
         xp = x.copy()
         xp[j] += h
-        D[:, j] = (f(xp, interactions, support_map, n) - fx) / h
+        D[:, j] = (f(xp, interactions, n) - fx) / h
+
     return D
 
 
-def jacobian_pc(x, interactions, support_map, n):
+def jacobian_pc(x, interactions, n):
     h = 1e-6
     fx = g_per_capita(x, interactions, n)
     D = np.zeros((n, n))
+
     for j in range(n):
         xp = x.copy()
         xp[j] += h
         D[:, j] = (g_per_capita(xp, interactions, n) - fx) / h
-    return D
 
+    return D
 
 ########## linearyzacja
 
-def linear_interaction_matrix(x, interactions, support_map, n):
+def linear_interaction_matrix(x, interactions, n):
     """
     A_ij = ∂f_i / ∂x_j (Jacobian)
     """
-    return jacobian(x, interactions, support_map, n)
+    return jacobian(x, interactions, n)
 
 
-def linear_potential(x, interactions, support_map, n):
+def save_linearized_interactions(sol, x_vals, interactions, n, output_dir):
+    """
+    Zapisuje Jacobian w czasie jako edge-list CSV:
+    time, j->i
+    """
+
+    rows = []
+
+    for t_idx, (t, x) in enumerate(zip(sol.t, x_vals)):
+        A = linear_interaction_matrix(x, interactions, n)
+
+        row = {"time": t}
+
+        for i in range(n):
+            for j in range(n):
+                row[f"{j+1}->{i+1}"] = A[i, j]
+
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+
+    out_path = output_dir / "linear_interactions.csv"
+    df.to_csv(out_path, index=False)
+
+    print(f"Saved: {out_path}")
+
+def linear_potential(x, interactions, n):
     """
     Potencjał = - entropia wag wierszy Jacobianu
     """
-    A = np.abs(linear_interaction_matrix(x, interactions, support_map, n))
+    A = np.abs(linear_interaction_matrix(x, interactions, n))
     H = 0.0
     for i in range(n):
         row = A[i]
@@ -390,11 +436,11 @@ def linear_potential(x, interactions, support_map, n):
     return H
 
 
-def linear_connectedness(x, interactions, support_map, n):
+def linear_connectedness(x, interactions, n):
     """
     Mutual-information-like structure on Jacobian graph
     """
-    A = np.abs(linear_interaction_matrix(x, interactions, support_map, n))
+    A = np.abs(linear_interaction_matrix(x, interactions, n))
     row_sum = A.sum(axis=1)
     col_sum = A.sum(axis=0)
     total = A.sum()
@@ -553,14 +599,14 @@ def draw_frame(ax, x, pos, A, t):
 # =========================
 # ANIMATION SAVE
 # =========================
-def save_linear_graph_animation(sol, x_vals, interactions, support_map, n, output_dir):
+def save_linear_graph_animation(sol, x_vals, interactions, n, output_dir):
 
     pos = circular_layout(n)
     fig, ax = plt.subplots(figsize=(6.5, 6.5))
 
     def update(frame):
         x = x_vals[frame]
-        A = jacobian(x, interactions, support_map, n)
+        A = jacobian(x, interactions, n)
         draw_frame(ax, x, pos, A, sol.t[frame])
 
     anim = FuncAnimation(fig, update, frames=len(sol.t), interval=40)
@@ -580,28 +626,71 @@ def save_linear_graph_animation(sol, x_vals, interactions, support_map, n, outpu
 
 ########## rzeczy do rysowania hipergrafu
 
+########## rzeczy do rysowania hipergrafu / grafu monomów
 
-def compute_layout(n, support_map):
-    pos = {}
+def monomial_to_str(mon):
+    parts = []
+    for idx, exp in enumerate(mon):
+        if exp == 0:
+            continue
+        var = f"x{idx + 1}"
+        if exp != 1:
+            var += f"^{exp}"
+        parts.append(var)
+    return "1" if not parts else "".join(parts)
+
+
+def unique_monomials(interactions):
+    monomials = sorted(
+        {mon for (mon, i) in interactions.keys() if mon != ()},
+        key=lambda mon: (sum(mon), mon)
+    )
+    return monomials
+
+
+def compute_layout(n, interactions):
+    monomials = unique_monomials(interactions)
+
+    pos_species = {}
+    pos_monomials = {}
+
+    x_species = np.linspace(0, max(n - 1, len(monomials) - 1, 1), n)
+    x_mono = np.linspace(0, max(n - 1, len(monomials) - 1, 1), len(monomials))
 
     for i in range(n):
-        pos[f"x{i}"] = (i, 0)
+        pos_species[i] = (x_species[i], 0.0)
 
-    for idx, K in enumerate(support_map):
-        pos[f"K{tuple(sorted(K))}"] = (idx, 1)
+    for k, mon in enumerate(monomials):
+        pos_monomials[mon] = (x_mono[k], 1.0)
 
-    return pos
+    return pos_species, pos_monomials, monomials
 
 
-def draw_hypergraph(ax, x, interactions, support_map, n):
+def draw_hypergraph(ax, x, interactions, n, layout=None):
     ax.clear()
 
-    T = T_ji(x, interactions, support_map, n)
+    x = np.maximum(np.asarray(x), 1e-12)
+
+    if layout is None:
+        pos_species, pos_monomials, monomials = compute_layout(n, interactions)
+    else:
+        pos_species, pos_monomials, monomials = layout
+
+    T = T_ji(x, interactions, n)
+
+    # filtr stałych i nieistniejących monomów
+    T = {k: v for k, v in T.items() if k[0] != ()}
+
+    if not T:
+        return
 
     max_w = max([abs(v) for v in T.values()] + [1e-12])
 
-    for (K, i), v in T.items():
-        if abs(v) < 1e-12:
+    # ---------------------
+    # EDGES
+    # ---------------------
+    for (mon, i), v in T.items():
+        if mon not in pos_monomials:
             continue
 
         w = np.log1p(abs(v)) / np.log1p(max_w)
@@ -609,18 +698,36 @@ def draw_hypergraph(ax, x, interactions, support_map, n):
         alpha = 0.2 + 0.8 * w
         lw = 0.5 + 4.0 * w
 
-        for j in K:
+        mono_xy = pos_monomials[mon]
+        target_xy = pos_species[i]
+
+        ax.plot(
+            [mono_xy[0], target_xy[0]],
+            [mono_xy[1], target_xy[1]],
+            color=color,
+            linewidth=lw,
+            alpha=alpha,
+            solid_capstyle="round",
+            zorder=1
+        )
+
+        sources = [j for j, exp in enumerate(mon) if exp > 0]
+        for s in sources:
+            source_xy = pos_species[s]
             ax.plot(
-                [j, i],
-                [1, 0],
-                color=color,
-                linewidth=lw,
-                alpha=alpha,
-                solid_capstyle='round'
+                [source_xy[0], mono_xy[0]],
+                [source_xy[1], mono_xy[1]],
+                color="grey",
+                linewidth=0.8,
+                alpha=0.25,
+                solid_capstyle="round",
+                zorder=0
             )
 
+    # species nodes
     ax.scatter(
-        range(n), [0] * n,
+        [pos_species[i][0] for i in range(n)],
+        [pos_species[i][1] for i in range(n)],
         s=250,
         c="black",
         edgecolors="white",
@@ -628,42 +735,80 @@ def draw_hypergraph(ax, x, interactions, support_map, n):
         zorder=3
     )
 
+    for i in range(n):
+        ax.text(
+            pos_species[i][0],
+            pos_species[i][1],
+            str(i + 1),
+            color="white",
+            ha="center",
+            va="center",
+            fontsize=11,
+            zorder=4
+        )
+
+    # monomials
+    if monomials:
+        ax.scatter(
+            [pos_monomials[mon][0] for mon in monomials],
+            [pos_monomials[mon][1] for mon in monomials],
+            s=180,
+            c="white",
+            edgecolors="black",
+            linewidths=1.0,
+            zorder=3
+        )
+
+        for mon in monomials:
+            ax.text(
+                pos_monomials[mon][0],
+                pos_monomials[mon][1],
+                monomial_to_str(mon),
+                color="black",
+                ha="center",
+                va="center",
+                fontsize=9,
+                zorder=4
+            )
+
+    xmax = max(
+        [p[0] for p in pos_species.values()] +
+        [p[0] for p in pos_monomials.values()] +
+        [0]
+    )
+
     ax.set_ylim(-0.5, 1.5)
-    ax.set_xlim(-0.5, n - 0.5)
-    ax.set_xticks(range(n))
+    ax.set_xlim(-0.5, xmax + 0.5)
+    ax.set_xticks([])
     ax.set_yticks([])
-    ax.set_title("Dynamic hypergraph of interactions T_ji(x)", fontsize=12)
+    ax.set_title("Dynamic monomial interaction graph T_ji(x)", fontsize=12)
     ax.grid(alpha=0.2)
 
 
-def interactive_hypergraph(sol, x_vals, interactions, support_map, n):
-    fig, ax = plt.subplots(figsize=(9, 4))
-    plt.subplots_adjust(bottom=0.25)
+def save_hypergraph_animation(sol, x_vals, interactions, n, output_dir):
+    fig, ax = plt.subplots(figsize=(10, 4))
 
-    t_idx = 0
-    draw_hypergraph(ax, x_vals[t_idx], interactions, support_map, n)
+    # filtr stałych monomów
+    filtered_interactions = {
+        (mon, i): coeff
+        for (mon, i), coeff in interactions.items()
+        if mon != ()
+    }
 
-    ax_slider = plt.axes([0.2, 0.1, 0.6, 0.03])
-    slider = Slider(ax_slider, 't', 0, len(sol.t) - 1, valinit=0, valstep=1)
-
-    def update(val):
-        i = int(slider.val)
-        draw_hypergraph(ax, x_vals[i], interactions, support_map, n)
-        ax.set_title(f"t = {sol.t[i]:.3f}")
-        fig.canvas.draw_idle()
-
-    slider.on_changed(update)
-    plt.show()
-
-
-def save_hypergraph_animation(sol, x_vals, interactions, support_map, n, output_dir):
-    fig, ax = plt.subplots(figsize=(9, 4))
+    layout = compute_layout(n, filtered_interactions)
 
     try:
         import matplotlib.animation as animation
 
         def frame(i):
-            draw_hypergraph(ax, x_vals[i], interactions, support_map, n)
+            ax.clear()
+            draw_hypergraph(
+                ax,
+                x_vals[i],
+                filtered_interactions,
+                n,
+                layout=layout
+            )
             ax.set_title(f"t = {sol.t[i]:.3f}")
 
         anim = animation.FuncAnimation(
@@ -679,27 +824,27 @@ def save_hypergraph_animation(sol, x_vals, interactions, support_map, n, output_
 
     except Exception as e:
         print("MP4 failed → saving GIF instead", e)
+
         output = output_dir / "hypergraph.gif"
         anim.save(str(output), writer=PillowWriter(fps=10))
         print(f"Saved: {output}")
 
     plt.close(fig)
 
-
 ###### odporności
 
-def R_loc(x, interactions, support_map, n):
-    vals = eigvals(jacobian(x, interactions, support_map, n))
+def R_loc(x, interactions, n):
+    vals = eigvals(jacobian(x, interactions, n))
     return -np.max(vals.real)
 
 
-def R_loc_pc(x, interactions, support_map, n):
-    vals = eigvals(jacobian_pc(x, interactions, support_map, n))
+def R_loc_pc(x, interactions, n):
+    vals = eigvals(jacobian_pc(x, interactions, n))
     return -np.max(vals.real)
 
 
-def R_spec(x, interactions, support_map, n):
-    J = jacobian(x, interactions, support_map, n)
+def R_spec(x, interactions, n):
+    J = jacobian(x, interactions, n)
     A = np.abs(J)
     Dout = np.diag(A.sum(axis=1))
     Din = np.diag(A.sum(axis=0))
@@ -720,8 +865,8 @@ def R_spec(x, interactions, support_map, n):
     return min(abs(v) for v in nonzero) if nonzero else 0.0
 
 
-def R_spec_pc(x, interactions, support_map, n):
-    J = jacobian_pc(x, interactions, support_map, n)
+def R_spec_pc(x, interactions, n):
+    J = jacobian_pc(x, interactions, n)
     A = np.abs(J)
     Dout = np.diag(A.sum(axis=1))
     Din = np.diag(A.sum(axis=0))
@@ -741,64 +886,112 @@ def R_spec_pc(x, interactions, support_map, n):
     nonzero = [v.real for v in vals if abs(v) > 1e-8]
     return min(abs(v) for v in nonzero) if nonzero else 0.0
 
-
-def R_energy_time_series(t, x_vals, interactions, support_map, n):
+def R_energy_time_series(t, x_vals, interactions, n):
     """
     Zwraca tablicę R_energy(t_i) = - ∫_{t_i}^{t_{i+τ}} ||f(x(s))||^2 ds
     Zakładamy równomierną siatkę czasową i stałe τ (np. 1 jednostka czasu).
     """
     tau = 1.0
     R_vals = []
+
     for i, t_i in enumerate(t):
         t_max = t_i + tau
         j = i
         while j < len(t) and t[j] <= t_max:
             j += 1
+
         if j == i:
             R_vals.append(0.0)
             continue
-        norms_sq = [np.linalg.norm(f(x_vals[k], interactions, support_map, n))**2 for k in range(i, j)]
+
+        norms_sq = [
+            np.linalg.norm(f(x_vals[k], interactions, n))**2
+            for k in range(i, j)
+        ]
         integral = trapezoid(norms_sq, t[i:j])
         R_vals.append(-integral)
+
     return np.array(R_vals)
 
 
-def R_energy_log_time_series(t, x_vals, interactions, support_map, n):
+def R_energy_log_time_series(t, x_vals, interactions, n):
     """
     Zwraca tablicę R_energy^{log}(t_i) = - ∫_{t_i}^{t_{i+τ}} ||f(log x(s))||^2 ds
     Zakładamy równomierną siatkę czasową i stałe τ (np. 5 jednostek czasu).
     """
     tau = 5.0
     R_vals = []
+
     for i, t_i in enumerate(t):
         t_max = t_i + tau
         j = i
         while j < len(t) and t[j] <= t_max:
             j += 1
+
         if j == i:
             R_vals.append(0.0)
             continue
+
         norms_sq = []
         for k in range(i, j):
             x_log = np.log(np.abs(x_vals[k]) + 1e-12)
-            norms_sq.append(np.linalg.norm(f(x_log, interactions, support_map, n))**2)
+            norms_sq.append(np.linalg.norm(f(x_log, interactions, n))**2)
+
         integral = trapezoid(norms_sq, t[i:j])
         R_vals.append(-integral)
+
     return np.array(R_vals)
 
 
-def R_norm(x, interactions, support_map, n):
-    return -np.linalg.norm(f(x, interactions, support_map, n))**2
+def R_energy_linear(x, interactions, n):
+    """
+    Energetyczna odporność spójna z linearyzacją:
+        R = - ||J(x) x||^2
+    """
+    J = jacobian(x, interactions, n)
+    y = J @ x
+    return -np.dot(y, y)
+
+
+def R_energy_linear_time_series(t, x_vals, interactions, n, tau=1.0):
+    """
+    Całkowana energia linearyzacji:
+        R(t_i) = - ∫ ||J(x(s))||_F^2 ds
+    """
+    R_vals = []
+
+    for i, t_i in enumerate(t):
+        t_max = t_i + tau
+        j = i
+        while j < len(t) and t[j] <= t_max:
+            j += 1
+
+        if j == i:
+            R_vals.append(0.0)
+            continue
+
+        norms_sq = []
+        for k in range(i, j):
+            J = jacobian(x_vals[k], interactions, n)
+            norms_sq.append(np.linalg.norm(J, ord="fro")**2)
+
+        integral = trapezoid(norms_sq, t[i:j])
+        R_vals.append(-integral)
+
+    return np.array(R_vals)
+
+def R_norm(x, interactions, n):
+    return -np.linalg.norm(f(x, interactions, n))**2
 
 
 def R_spec_hyper(x, interactions, n):
     A = np.zeros((n, n))
-    for j, alpha in interactions.items():
-        xj = x_pow_j(x, j)
+
+    for (mon, i), alpha in interactions.items():
+        xj = x_pow_j(x, mon)
         for k in range(n):
-            if j[k] > 0:
-                for i in range(n):
-                    A[k, i] += abs(alpha[i] * xj)
+            if mon[k] > 0:
+                A[k, i] += abs(alpha * xj)
 
     Dout = np.diag(A.sum(axis=1))
     Din = np.diag(A.sum(axis=0))
@@ -820,37 +1013,49 @@ def R_spec_hyper(x, interactions, n):
 
     return min(nonzero_real_parts) if nonzero_real_parts else 0.0
 
+from collections import defaultdict
+import numpy as np
 
-def R_tensor_laplacian(x, interactions, support_map, n):
+def R_tensor_laplacian(x, interactions, n):
     """
-    Nowa miara odporności oparta o spektrum tensorowego Laplasjanu.
+    Miara odporności oparta o spektrum tensorowego Laplasjanu.
 
-    Idea:
-        - budujemy hipergraf z interakcji w punkcie x
-        - liczymy dominującą wartość własną Laplasjanu tensorowego
-        - interpretujemy ją jako miarę "sztywności / odporności strukturalnej"
-
-    Zwraca:
-        R = -lambda_max
-        (im większe R, tym bardziej stabilny układ)
+    Liczymy ją osobno dla każdego rzędu interakcji i składamy
+    jako średnią ważoną po sile interakcji.
     """
+    if not interactions:
+        return 0.0
 
-    # --- wyciągamy wymiar tensora ---
-    k = len(next(iter(support_map))) if support_map else 2
+    # grupowanie interakcji według rzędu monomialu
+    by_order = defaultdict(dict)
 
-    # --- budowa spektrum ---
-    result = compute_tensor_laplacian_spectrum(
-        interactions=interactions,
-        x=x,
-        n=n,
-        k=k
-    )
+    for (mon, target), coeff in interactions.items():
+        order = sum(1 for e in mon if e > 0)   # BEZ +1
+        if order == 0:
+            continue
+        by_order[order][(mon, target)] = coeff
 
-    lam = result["lambda"]
+    if not by_order:
+        return 0.0
 
-    # --- konwencja stabilności ---
-    return -lam
+    total_weight = 0.0
+    weighted_sum = 0.0
 
+    for order, sub_interactions in by_order.items():
+        result = compute_tensor_laplacian_spectrum(
+            interactions=sub_interactions,
+            x=x,
+            n=n,
+            k=order
+        )
+
+        # waga = suma modułów współczynników w danym rzędzie
+        weight = sum(abs(c) for c in sub_interactions.values())
+
+        total_weight += weight
+        weighted_sum += weight * (-result["lambda"])
+
+    return weighted_sum / total_weight if total_weight > 0 else 0.0
 
 def plot_phase_colored_curve(potential_vals, connected_vals, resilience_vals, time_vals,
                              xlabel="Potential", ylabel="Connectedness",
@@ -926,7 +1131,8 @@ PLOT_GROUPS = {
         "linear_potential",
         "linear_connectedness",
         "R_loc",
-        "R_energy",
+        "R_energy_linear",
+        "R_energy_linear_time_series",
         "R_spec",
     ],
     "hypergraph_plots": [
@@ -959,6 +1165,8 @@ PLOT_LABELS = {
     "Rtensor_laplacian" : "Rtensor_laplacian",
     "linear_potential": "Linear Potential",
     "linear_connectedness": "Linear Connectedness",
+    "R_energy_linear": "R_energy_jacobian",
+    "R_energy_linear_time_series" : "R_energy_linear_time_series",
 }
 
 PLOT_STYLES = {
@@ -969,6 +1177,8 @@ PLOT_STYLES = {
     "R_loc_pc": "r-",
     "R_spec": "r-",
     "R_energy": "r-",
+    "R_energy_linear": "r-",
+    "R_energy_linear_time_series" : "r-",
     "Rtensor_laplacian" : "r-",
     "Rspec_hyper": "r-",
     "linear_potential": "g-",
@@ -1072,12 +1282,12 @@ def main():
         output_dir = prepare_output_dir(args.save_prefix)
         print(f"Zapis wyników do katalogu: {output_dir}")
 
-    n, x0, interactions, support_map = load_model(input_path)
+    n, x0, interactions = load_model(input_path)
 
     t_eval = np.linspace(0, args.time, int(args.time * 10))
     def rhs(t, x):
         x = np.clip(x, 1e-12, 1e6)  # stabilizacja
-        return f(x, interactions, support_map, n)
+        return f(x, interactions, n)
 
     sol = solve_ivp(
         rhs,
@@ -1095,31 +1305,33 @@ def main():
     # =========================
     # METRICS
     # =========================
-    potential_vals = np.array([potential(x, interactions, support_map, n) for x in x_vals])
-    potential_global_vals = np.array([potential_global(x, interactions, support_map, n) for x in x_vals])
-    connected_vals = np.array([connectedness(x, interactions, support_map, n) for x in x_vals])
-    row_entropy_vals = np.array([row_entropy_connectedness(x, interactions, support_map, n) for x in x_vals])
+    potential_vals = np.array([potential(x, interactions, n) for x in x_vals])
+    potential_global_vals = np.array([potential_global(x, interactions, n) for x in x_vals])
+    connected_vals = np.array([connectedness(x, interactions, n) for x in x_vals])
+    row_entropy_vals = np.array([row_entropy_connectedness(x, interactions, n) for x in x_vals])
 
-    Rloc = np.array([R_loc(x, interactions, support_map, n) for x in x_vals])
-    Rloc_pc = np.array([R_loc_pc(x, interactions, support_map, n) for x in x_vals])
+    Rloc = np.array([R_loc(x, interactions, n) for x in x_vals])
+    Rloc_pc = np.array([R_loc_pc(x, interactions, n) for x in x_vals])
 
-    Rspec = np.array([R_spec(x, interactions, support_map, n) for x in x_vals])
-    Rspec_pc = np.array([R_spec_pc(x, interactions, support_map, n) for x in x_vals])
+    Rspec = np.array([R_spec(x, interactions, n) for x in x_vals])
+    Rspec_pc = np.array([R_spec_pc(x, interactions, n) for x in x_vals])
 
-    Renergy = R_energy_time_series(sol.t, x_vals, interactions, support_map, n)
-    Renergy_pc = R_energy_log_time_series(sol.t, x_vals, interactions, support_map, n)
+    Renergy = R_energy_time_series(sol.t, x_vals, interactions, n)
+    Renergy_pc = R_energy_log_time_series(sol.t, x_vals, interactions, n)
+    Renergy_linear = np.array([R_energy_linear(x, interactions, n) for x in x_vals])
+    Renergy_linear_time_series = R_energy_linear_time_series(sol.t, x_vals, interactions, n)
 
-    Rnorm = np.array([R_norm(x, interactions, support_map, n) for x in x_vals])
+    Rnorm = np.array([R_norm(x, interactions, n) for x in x_vals])
     Rspec_hyper = np.array([R_spec_hyper(x, interactions, n) for x in x_vals])
-    Rtensor_laplacian = np.array([R_tensor_laplacian(x, interactions, support_map, n) for x in x_vals])
+    Rtensor_laplacian = np.array([R_tensor_laplacian(x, interactions, n) for x in x_vals])
 
     linear_pot_vals = np.array([
-        linear_potential(x, interactions, support_map, n)
+        linear_potential(x, interactions, n)
         for x in x_vals
     ])
 
     linear_conn_vals = np.array([
-        linear_connectedness(x, interactions, support_map, n)
+        linear_connectedness(x, interactions, n)
         for x in x_vals
     ])
 
@@ -1127,6 +1339,8 @@ def main():
     # SAVE CSV
     # =========================
     if output_dir is not None:
+        save_tensor_interactions(sol, x_vals, interactions, n, output_dir)
+        save_linearized_interactions(sol, x_vals, interactions, n, output_dir)
         np.savetxt(
             str(output_dir / "potential.csv"),
             np.column_stack((sol.t, potential_vals)),
@@ -1171,6 +1385,16 @@ def main():
             str(output_dir / "R_energy.csv"),
             np.column_stack((sol.t, Renergy)),
             delimiter=",", header="time,R_energy", comments=""
+        )
+        np.savetxt(
+            str(output_dir / "R_energy_linear.csv"),
+            np.column_stack((sol.t, Renergy_linear)),
+            delimiter=",", header="time,R_energy_linear", comments=""
+        )
+        np.savetxt(
+            str(output_dir / "R_energy_linear_jacobian.csv"),
+            np.column_stack((sol.t, Renergy_linear_time_series)),
+            delimiter=",", header="time,R_energy_linear_jacobian", comments=""
         )
         #np.savetxt(
         #    str(output_dir / "R_energy_pc.csv"),
@@ -1221,6 +1445,8 @@ def main():
         "R_spec": Rspec,
         #"R_spec_pc": Rspec_pc,
         "R_energy": Renergy,
+        "R_energy_linear": Renergy_linear,
+        "R_energy_linear_time_series": Renergy_linear_time_series,
         #"R_energy_pc": Renergy_pc,
         #"R_norm": Rnorm,
         "Rspec_hyper": Rspec_hyper,
@@ -1304,7 +1530,6 @@ def main():
             sol,
             x_vals,
             interactions,
-            support_map,
             n,
             output_dir
         )
@@ -1313,7 +1538,6 @@ def main():
             sol,
             x_vals,
             interactions,
-            support_map,
             n,
             output_dir
         )
@@ -1321,7 +1545,7 @@ def main():
     else:
         fig = plot_all()
         plt.show()
-        interactive_hypergraph(sol, x_vals, interactions, support_map, n)
+        interactive_hypergraph(sol, x_vals, interactions, n)
 
 
 if __name__ == "__main__":

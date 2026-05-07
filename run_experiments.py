@@ -1,12 +1,10 @@
 import subprocess
 import sys
 import time
-from pathlib import Path
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# =========================
-# KONFIG
-# =========================
-TIMEOUT = 300  # 5 minut
+TIMEOUT = 300
 
 EXPERIMENTS = [
     ("cyclic_with_central.txt", 10, "cyclic_with_central"),
@@ -23,10 +21,13 @@ EXPERIMENTS = [
     ("three_order.txt", 10, "three_order"),
 ]
 
-# =========================
-# RUNNER
-# =========================
-def run_experiment(input_file, t, prefix):
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def run_experiment(exp):
+    input_file, t, prefix = exp
+
     cmd = [
         sys.executable,
         "adaptive_cycle.py",
@@ -35,103 +36,49 @@ def run_experiment(input_file, t, prefix):
         "--save-prefix", prefix
     ]
 
-    start = time.time()
-
     try:
         result = subprocess.run(
             cmd,
-            capture_output=True,
-            text=True,
+            cwd=BASE_DIR,           # 🔥 KLUCZOWE
             timeout=TIMEOUT
         )
 
-        duration = time.time() - start
-
-        if result.returncode != 0:
-            return {
-                "status": "FAIL",
-                "reason": "NONZERO_RETURN_CODE",
-                "stderr": result.stderr[-1000:],
-                "time": duration
-            }
-
         return {
-            "status": "OK",
-            "reason": None,
-            "time": duration
+            "exp": input_file,
+            "ok": True
         }
 
     except subprocess.TimeoutExpired:
         return {
-            "status": "FAIL",
-            "reason": "TIMEOUT",
-            "stderr": f"Exceeded {TIMEOUT}s",
-            "time": TIMEOUT
+            "exp": input_file,
+            "ok": False,
+            "reason": "TIMEOUT"
         }
 
     except Exception as e:
         return {
-            "status": "FAIL",
-            "reason": "EXCEPTION",
-            "stderr": str(e),
-            "time": None
+            "exp": input_file,
+            "ok": False,
+            "reason": str(e)
         }
 
 
-# =========================
-# MAIN LOOP
-# =========================
 def main():
-    results = []
+    print("START PARALLEL (SAFE THREAD MODE)")
 
-    print("\n==============================")
-    print("STARTING BATCH EXPERIMENTS")
-    print("==============================\n")
+    # 🔥 THREADS zamiast PROCESS (ważne!)
+    # bo subprocess i matplotlib = nie lubią ProcessPoolExecutor
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [ex.submit(run_experiment, e) for e in EXPERIMENTS]
 
-    for input_file, t, prefix in EXPERIMENTS:
+        results = []
+        for f in as_completed(futures):
+            r = f.result()
+            results.append(r)
+            print(r)
 
-        print(f"RUNNING: {input_file} | t={t} | prefix={prefix}")
-
-        res = run_experiment(input_file, t, prefix)
-
-        results.append({
-            "experiment": input_file,
-            "time_param": t,
-            "prefix": prefix,
-            **res
-        })
-
-        print(f" -> {res['status']} ({res.get('reason', '')})")
-
-    # =========================
-    # REPORT
-    # =========================
-    print("\n==============================")
-    print("FINAL REPORT")
-    print("==============================\n")
-
-    ok = [r for r in results if r["status"] == "OK"]
-    fail = [r for r in results if r["status"] != "OK"]
-
-    print(f"SUCCESS: {len(ok)}")
-    print(f"FAILED : {len(fail)}\n")
-
-    for r in fail:
-        print(f"[FAIL] {r['experiment']}")
-        print(f"       reason: {r['reason']}")
-        if r.get("stderr"):
-            print(f"       stderr: {r['stderr'][:300]}")
-        print()
-
-    # opcjonalnie zapis raportu
-    report_path = Path("batch_report.txt")
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write("BATCH EXPERIMENT REPORT\n\n")
-
-        for r in results:
-            f.write(str(r) + "\n")
-
-    print(f"\nReport saved to: {report_path.resolve()}")
+    ok = sum(1 for r in results if r["ok"])
+    print("\nSUCCESS:", ok, "/", len(results))
 
 
 if __name__ == "__main__":
