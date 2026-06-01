@@ -1545,7 +1545,7 @@ def main():
     else:
         fig = plot_all()
         plt.show()
-        interactive_hypergraph(sol, x_vals, interactions, n)
+        #interactive_hypergraph(sol, x_vals, interactions, n)
 
 
 if __name__ == "__main__":
