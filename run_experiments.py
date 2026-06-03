@@ -19,6 +19,12 @@ EXPERIMENTS = [
     ("simple.txt", 10, "simple"),
     ("trophic.txt", 25, "trophic"),
     ("three_order.txt", 10, "three_order"),
+    ("equilibria.txt", 13, "equlibira"),
+    ("equilibria2.txt", 13, "equlibira2"),
+    ("equilibria3.txt", 13, "equlibira3"),
+    ("best_example.txt", 10, "best1"),
+    ("best_example2.txt", 20, "best2"),
+    ("best_example3.txt", 10, "best3"),
 ]
 
 

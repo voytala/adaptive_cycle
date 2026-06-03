@@ -984,14 +984,23 @@ def R_norm(x, interactions, n):
     return -np.linalg.norm(f(x, interactions, n))**2
 
 
-def R_spec_hyper(x, interactions, n):
+def hypergraph_adjacency_matrix(x, interactions, n):
+    """
+    Macierz A używana przez R_spec_hyper.
+    """
     A = np.zeros((n, n))
 
     for (mon, i), alpha in interactions.items():
         xj = x_pow_j(x, mon)
+
         for k in range(n):
             if mon[k] > 0:
                 A[k, i] += abs(alpha * xj)
+
+    return A
+
+def R_spec_hyper(x, interactions, n):
+    A = hypergraph_adjacency_matrix(x, interactions, n)
 
     Dout = np.diag(A.sum(axis=1))
     Din = np.diag(A.sum(axis=0))
@@ -1000,7 +1009,10 @@ def R_spec_hyper(x, interactions, n):
     c = 1.0 / A_max if A_max > 0 else 1.0
 
     def safe_inv_sqrt_diag(D):
-        return np.diag([1 / np.sqrt(v) if v > 0 else 0.0 for v in np.diag(D)])
+        return np.diag([
+            1 / np.sqrt(v) if v > 0 else 0.0
+            for v in np.diag(D)
+        ])
 
     Dout_inv_sqrt = safe_inv_sqrt_diag(Dout)
     Din_inv_sqrt = safe_inv_sqrt_diag(Din)
@@ -1008,10 +1020,39 @@ def R_spec_hyper(x, interactions, n):
     Lout = c * Dout_inv_sqrt @ (Dout - A) @ Dout_inv_sqrt
     Lin = c * Din_inv_sqrt @ (Din - A.T) @ Din_inv_sqrt
 
-    eigvals_combined = np.concatenate([np.linalg.eigvals(Lout), np.linalg.eigvals(Lin)])
-    nonzero_real_parts = [abs(ev.real) for ev in eigvals_combined if abs(ev) > 1e-8]
+    eigvals_combined = np.concatenate([
+        np.linalg.eigvals(Lout),
+        np.linalg.eigvals(Lin)
+    ])
+
+    nonzero_real_parts = [
+        abs(ev.real)
+        for ev in eigvals_combined
+        if abs(ev) > 1e-8
+    ]
 
     return min(nonzero_real_parts) if nonzero_real_parts else 0.0
+
+def save_adjacency_matrices(sol, x_vals, interactions, n, output_dir):
+    rows = []
+
+    for t, x in zip(sol.t, x_vals):
+        A = hypergraph_adjacency_matrix(x, interactions, n)
+
+        row = {"time": t}
+
+        for i in range(n):
+            for j in range(n):
+                row[f"A_{i+1}_{j+1}"] = A[i, j]
+
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+
+    out_path = output_dir / "A_matrix.csv"
+    df.to_csv(out_path, index=False)
+
+    print(f"Saved: {out_path}")
 
 from collections import defaultdict
 import numpy as np
@@ -1339,6 +1380,7 @@ def main():
     # SAVE CSV
     # =========================
     if output_dir is not None:
+        save_adjacency_matrices(sol, x_vals, interactions, n, output_dir)
         save_tensor_interactions(sol, x_vals, interactions, n, output_dir)
         save_linearized_interactions(sol, x_vals, interactions, n, output_dir)
         np.savetxt(
